@@ -91,6 +91,16 @@ You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"
 
 ## Tools
 
+### Agent-facing request behavior
+
+Each tool publishes its valid `operation` values in the MCP schema. Operation
+payloads are checked before they reach a backend, so missing fields and invalid
+values return an actionable error instead of a backend traceback.
+
+Use `system(operation="status")` to see the operation list supported by the
+active backend. Backend failures keep the existing `error` string and now also
+include an `error_code`, `tool`, `operation`, and `backend` when available.
+
 ### `drawing` — File/drawing management
 
 | Operation | Description | File IPC | ezdxf |

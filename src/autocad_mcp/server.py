@@ -7,13 +7,27 @@ from __future__ import annotations
 
 import structlog
 from mcp.server.fastmcp import FastMCP
+from typing import Any
 
 from autocad_mcp.client import (
     _error,
     _json,
+    _result_dict,
     _safe,
     add_screenshot_if_available,
     get_backend,
+)
+from autocad_mcp.contracts import (
+    AnnotationOperation,
+    BlockOperation,
+    DrawingOperation,
+    EntityOperation,
+    LayerOperation,
+    PIDOperation,
+    SystemOperation,
+    ViewOperation,
+    ensure_supported,
+    validate_operation,
 )
 
 # FastMCP validates return types via Pydantic. Tools that may return
@@ -25,6 +39,29 @@ log = structlog.get_logger()
 mcp = FastMCP("autocad-mcp")
 
 
+def _merge_data(data: dict | None, **values: Any) -> dict:
+    """Merge legacy top-level arguments into the operation payload."""
+    payload = dict(data or {})
+    for key, value in values.items():
+        if value is not None:
+            payload.setdefault(key, value)
+    return payload
+
+
+def _validate(tool: str, operation: str, data: dict | None = None, **values: Any) -> dict:
+    return validate_operation(tool, operation, _merge_data(data, **values))
+
+
+def _unknown(tool: str, operation: str) -> str:
+    return _json({
+        "ok": False,
+        "error": f"Unknown {tool} operation: {operation}",
+        "error_code": "invalid_operation",
+        "tool": tool,
+        "operation": operation,
+    })
+
+
 # ==========================================================================
 # 1. drawing — File/drawing management
 # ==========================================================================
@@ -33,7 +70,7 @@ mcp = FastMCP("autocad-mcp")
 @mcp.tool(annotations={"title": "AutoCAD Drawing Operations", "readOnlyHint": False})
 @_safe("drawing")
 async def drawing(
-    operation: str,
+    operation: DrawingOperation,
     data: dict | None = None,
     include_screenshot: bool = False,
 ) -> ToolResult:
@@ -53,6 +90,8 @@ async def drawing(
     """
     data = data or {}
     backend = await get_backend()
+    ensure_supported(backend, "drawing", operation)
+    data = _validate("drawing", operation, data)
 
     if operation == "create":
         result = await backend.drawing_create(data.get("name"))
@@ -75,9 +114,9 @@ async def drawing(
     elif operation == "redo":
         result = await backend.redo()
     else:
-        return _json({"error": f"Unknown drawing operation: {operation}"})
+        return _unknown("drawing", operation)
 
-    return await add_screenshot_if_available(result, include_screenshot)
+    return await add_screenshot_if_available(result, include_screenshot, "drawing", operation)
 
 
 # ==========================================================================
@@ -88,7 +127,7 @@ async def drawing(
 @mcp.tool(annotations={"title": "AutoCAD Entity Operations", "readOnlyHint": False})
 @_safe("entity")
 async def entity(
-    operation: str,
+    operation: EntityOperation,
     x1: float | None = None,
     y1: float | None = None,
     x2: float | None = None,
@@ -128,8 +167,27 @@ async def entity(
       chamfer — data: {id1, id2, dist1, dist2}
       erase   — entity_id
     """
-    data = data or {}
     backend = await get_backend()
+    ensure_supported(backend, "entity", operation)
+    data = _validate(
+        "entity",
+        operation,
+        data,
+        x1=x1,
+        y1=y1,
+        x2=x2,
+        y2=y2,
+        points=points,
+        layer=layer,
+        entity_id=entity_id,
+    )
+    x1 = data.get("x1", x1)
+    y1 = data.get("y1", y1)
+    x2 = data.get("x2", x2)
+    y2 = data.get("y2", y2)
+    points = data.get("points", points)
+    layer = data.get("layer", layer)
+    entity_id = data.get("entity_id", entity_id)
 
     # --- Create ---
     if operation == "create_line":
@@ -177,9 +235,9 @@ async def entity(
     elif operation == "erase":
         result = await backend.entity_erase(entity_id)
     else:
-        return _json({"error": f"Unknown entity operation: {operation}"})
+        return _unknown("entity", operation)
 
-    return await add_screenshot_if_available(result, include_screenshot)
+    return await add_screenshot_if_available(result, include_screenshot, "entity", operation)
 
 
 # ==========================================================================
@@ -190,7 +248,7 @@ async def entity(
 @mcp.tool(annotations={"title": "AutoCAD Layer Operations", "readOnlyHint": False})
 @_safe("layer")
 async def layer(
-    operation: str,
+    operation: LayerOperation,
     data: dict | None = None,
     include_screenshot: bool = False,
 ) -> ToolResult:
@@ -208,6 +266,8 @@ async def layer(
     """
     data = data or {}
     backend = await get_backend()
+    ensure_supported(backend, "layer", operation)
+    data = _validate("layer", operation, data)
 
     if operation == "list":
         result = await backend.layer_list()
@@ -226,9 +286,9 @@ async def layer(
     elif operation == "unlock":
         result = await backend.layer_unlock(data["name"])
     else:
-        return _json({"error": f"Unknown layer operation: {operation}"})
+        return _unknown("layer", operation)
 
-    return await add_screenshot_if_available(result, include_screenshot)
+    return await add_screenshot_if_available(result, include_screenshot, "layer", operation)
 
 
 # ==========================================================================
@@ -239,7 +299,7 @@ async def layer(
 @mcp.tool(annotations={"title": "AutoCAD Block Operations", "readOnlyHint": False})
 @_safe("block")
 async def block(
-    operation: str,
+    operation: BlockOperation,
     data: dict | None = None,
     include_screenshot: bool = False,
 ) -> ToolResult:
@@ -255,6 +315,8 @@ async def block(
     """
     data = data or {}
     backend = await get_backend()
+    ensure_supported(backend, "block", operation)
+    data = _validate("block", operation, data)
 
     if operation == "list":
         result = await backend.block_list()
@@ -275,9 +337,9 @@ async def block(
     elif operation == "define":
         result = await backend.block_define(data["name"], data.get("entities", []))
     else:
-        return _json({"error": f"Unknown block operation: {operation}"})
+        return _unknown("block", operation)
 
-    return await add_screenshot_if_available(result, include_screenshot)
+    return await add_screenshot_if_available(result, include_screenshot, "block", operation)
 
 
 # ==========================================================================
@@ -288,7 +350,7 @@ async def block(
 @mcp.tool(annotations={"title": "AutoCAD Annotation Operations", "readOnlyHint": False})
 @_safe("annotation")
 async def annotation(
-    operation: str,
+    operation: AnnotationOperation,
     data: dict | None = None,
     include_screenshot: bool = False,
 ) -> ToolResult:
@@ -304,6 +366,8 @@ async def annotation(
     """
     data = data or {}
     backend = await get_backend()
+    ensure_supported(backend, "annotation", operation)
+    data = _validate("annotation", operation, data)
 
     if operation == "create_text":
         result = await backend.create_text(
@@ -329,9 +393,9 @@ async def annotation(
     elif operation == "create_leader":
         result = await backend.create_leader(data["points"], data["text"])
     else:
-        return _json({"error": f"Unknown annotation operation: {operation}"})
+        return _unknown("annotation", operation)
 
-    return await add_screenshot_if_available(result, include_screenshot)
+    return await add_screenshot_if_available(result, include_screenshot, "annotation", operation)
 
 
 # ==========================================================================
@@ -342,7 +406,7 @@ async def annotation(
 @mcp.tool(annotations={"title": "P&ID Operations (CTO Library)", "readOnlyHint": False})
 @_safe("pid")
 async def pid(
-    operation: str,
+    operation: PIDOperation,
     data: dict | None = None,
     include_screenshot: bool = False,
 ) -> ToolResult:
@@ -364,6 +428,8 @@ async def pid(
     """
     data = data or {}
     backend = await get_backend()
+    ensure_supported(backend, "pid", operation)
+    data = _validate("pid", operation, data)
 
     if operation == "setup_layers":
         result = await backend.pid_setup_layers()
@@ -405,9 +471,9 @@ async def pid(
             data.get("scale", 1.0), data.get("attributes"),
         )
     else:
-        return _json({"error": f"Unknown pid operation: {operation}"})
+        return _unknown("pid", operation)
 
-    return await add_screenshot_if_available(result, include_screenshot)
+    return await add_screenshot_if_available(result, include_screenshot, "pid", operation)
 
 
 # ==========================================================================
@@ -418,7 +484,7 @@ async def pid(
 @mcp.tool(annotations={"title": "AutoCAD View Operations", "readOnlyHint": True})
 @_safe("view")
 async def view(
-    operation: str,
+    operation: ViewOperation,
     x1: float | None = None,
     y1: float | None = None,
     x2: float | None = None,
@@ -432,13 +498,19 @@ async def view(
       get_screenshot — Capture current view as PNG image.
     """
     backend = await get_backend()
+    ensure_supported(backend, "view", operation)
+    data = _validate("view", operation, {}, x1=x1, y1=y1, x2=x2, y2=y2)
+    x1 = data.get("x1", x1)
+    y1 = data.get("y1", y1)
+    x2 = data.get("x2", x2)
+    y2 = data.get("y2", y2)
 
     if operation == "zoom_extents":
         result = await backend.zoom_extents()
-        return _json(result.to_dict())
+        return _json(_result_dict(result, "view", operation, backend.name))
     elif operation == "zoom_window":
         result = await backend.zoom_window(x1, y1, x2, y2)
-        return _json(result.to_dict())
+        return _json(_result_dict(result, "view", operation, backend.name))
     elif operation == "get_screenshot":
         result = await backend.get_screenshot()
         if result.ok and result.payload:
@@ -448,9 +520,9 @@ async def view(
                 TextContent(type="text", text=_json({"ok": True, "screenshot": "attached"})),
                 ImageContent(type="image", data=result.payload, mimeType="image/png"),
             ]
-        return _json(result.to_dict())
+        return _json(_result_dict(result, "view", operation, backend.name))
     else:
-        return _json({"error": f"Unknown view operation: {operation}"})
+        return _unknown("view", operation)
 
 
 # ==========================================================================
@@ -461,7 +533,7 @@ async def view(
 @mcp.tool(annotations={"title": "AutoCAD MCP System", "readOnlyHint": True})
 @_safe("system")
 async def system(
-    operation: str,
+    operation: SystemOperation,
     data: dict | None = None,
     include_screenshot: bool = False,
 ) -> ToolResult:
@@ -476,11 +548,12 @@ async def system(
       execute_lisp  — Execute arbitrary AutoLISP code (File IPC only). data: {code}
     """
     data = data or {}
+    data = _validate("system", operation, data)
 
     if operation == "status" or operation == "get_backend":
         backend = await get_backend()
         result = await backend.status()
-        return await add_screenshot_if_available(result, include_screenshot)
+        return await add_screenshot_if_available(result, include_screenshot, "system", operation)
     elif operation == "health":
         try:
             backend = await get_backend()
@@ -511,12 +584,11 @@ async def system(
         return _json(result.to_dict())
     elif operation == "execute_lisp":
         backend = await get_backend()
-        if not data.get("code"):
-            return _json({"error": "data.code is required"})
+        ensure_supported(backend, "system", operation)
         result = await backend.execute_lisp(data["code"])
-        return await add_screenshot_if_available(result, include_screenshot)
+        return await add_screenshot_if_available(result, include_screenshot, "system", operation)
     else:
-        return _json({"error": f"Unknown system operation: {operation}"})
+        return _unknown("system", operation)
 
 
 # ==========================================================================

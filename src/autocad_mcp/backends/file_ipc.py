@@ -71,7 +71,7 @@ class FileIPCBackend(AutoCADBackend):
 
     @property
     def capabilities(self) -> BackendCapabilities:
-        return BackendCapabilities(
+        caps = BackendCapabilities(
             can_read_drawing=True,
             can_modify_entities=True,
             can_create_entities=True,
@@ -83,6 +83,39 @@ class FileIPCBackend(AutoCADBackend):
             can_file_operations=True,
             can_undo=True,
         )
+        caps.operations = {
+                "drawing": [
+                    "create", "open", "info", "save", "save_as_dxf", "plot_pdf", "purge",
+                    "get_variables", "undo", "redo",
+                ],
+                "entity": [
+                    "create_line", "create_circle", "create_polyline", "create_rectangle",
+                    "create_arc", "create_ellipse", "create_mtext", "create_hatch",
+                    "list", "count", "get", "copy", "move", "rotate", "scale", "mirror",
+                    "offset", "array", "fillet", "chamfer", "erase",
+                ],
+                "layer": [
+                    "list", "create", "set_current", "set_properties", "freeze", "thaw",
+                    "lock", "unlock",
+                ],
+                "block": [
+                    "list", "insert", "insert_with_attributes", "get_attributes",
+                    "update_attribute",
+                ],
+                "annotation": [
+                    "create_text", "create_dimension_linear", "create_dimension_aligned",
+                    "create_dimension_angular", "create_dimension_radius", "create_leader",
+                ],
+                "pid": [
+                    "setup_layers", "insert_symbol", "list_symbols", "draw_process_line",
+                    "connect_equipment", "add_flow_arrow", "add_equipment_tag",
+                    "add_line_number", "insert_valve", "insert_instrument", "insert_pump",
+                    "insert_tank",
+                ],
+                "view": ["zoom_extents", "zoom_window", "get_screenshot"],
+                "system": ["execute_lisp"],
+        }
+        return caps
 
     async def initialize(self) -> CommandResult:
         """Find AutoCAD window and verify dispatcher is loaded."""

@@ -13,6 +13,7 @@ from mcp.types import ImageContent, TextContent
 
 from autocad_mcp.backends.base import AutoCADBackend, CommandResult
 from autocad_mcp.config import ONLY_TEXT_FEEDBACK, detect_backend
+from autocad_mcp.contracts import ContractError
 
 log = structlog.get_logger()
 
@@ -74,23 +75,52 @@ def _json(data: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _error(e: Exception, context: str = "") -> str:
+def _error(
+    e: Exception,
+    context: str = "",
+    error_code: str | None = None,
+    **metadata: Any,
+) -> str:
     """Format an exception with an actionable hint."""
     msg = str(e)
     msg_lower = msg.lower()
+    hint = "Unexpected error. Check AutoCAD is responsive and retry."
 
-    if "window not found" in msg_lower or "no autocad" in msg_lower:
+    if error_code:
+        code = error_code
+    elif isinstance(e, ContractError):
+        code = e.code
+    elif "window not found" in msg_lower or "no autocad" in msg_lower:
+        code = "backend_error"
         hint = "AutoCAD LT is not running or no drawing is open. Start AutoCAD and open a .dwg file."
     elif "timeout" in msg_lower:
+        code = "backend_error"
         hint = "Command timed out. AutoCAD may be in a modal dialog. Press ESC in AutoCAD and retry."
     elif "not supported" in msg_lower or "backend" in msg_lower:
+        code = "backend_error"
         hint = "Operation not supported on current backend. Check system(operation='status') for capabilities."
     elif "dispatcher" in msg_lower or "mcp_dispatch" in msg_lower:
+        code = "backend_error"
         hint = "mcp_dispatch.lsp not loaded. In AutoCAD command line, type: (load \"mcp_dispatch.lsp\")"
     else:
+        code = "internal_error"
         hint = "Unexpected error. Check AutoCAD is responsive and retry."
 
-    return _json({"error": f"[{context}] {msg}" if context else msg, "hint": hint})
+    if code == "invalid_input":
+        hint = "Check the operation's required fields and value ranges, then retry."
+    elif code == "unsupported_operation":
+        hint = "Inspect system(operation='status') or select a backend that supports this operation."
+
+    response = {
+        "ok": False,
+        "error": f"[{context}] {msg}" if context else msg,
+        "error_code": code,
+        "hint": hint,
+    }
+    if isinstance(e, ContractError):
+        response.update(e.details)
+    response.update(metadata)
+    return _json(response)
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +139,7 @@ def _safe(tool_name: str):
             except Exception as e:
                 op = kwargs.get("operation", "unknown")
                 log.error("tool_error", tool=tool_name, operation=op, error=str(e))
-                return _error(e, f"{tool_name}.{op}")
+                return _error(e, f"{tool_name}.{op}", tool=tool_name, operation=op)
 
         return wrapper
 
@@ -121,17 +151,39 @@ def _safe(tool_name: str):
 # ---------------------------------------------------------------------------
 
 
+def _result_dict(
+    result: CommandResult,
+    tool: str | None = None,
+    operation: str | None = None,
+    backend: str | None = None,
+) -> dict[str, Any]:
+    """Add stable context to backend failures without changing success data."""
+    data = result.to_dict()
+    if not result.ok:
+        data.setdefault("error_code", "backend_error")
+        if tool:
+            data["tool"] = tool
+        if operation:
+            data["operation"] = operation
+        if backend:
+            data["backend"] = backend
+    return data
+
+
 def _format_result(
     result: CommandResult,
     include_screenshot: bool = False,
     screenshot_data: str | None = None,
+    tool: str | None = None,
+    operation: str | None = None,
+    backend: str | None = None,
 ) -> list[TextContent | ImageContent] | str:
     """Format a CommandResult for MCP response.
 
     Returns a list with TextContent + optional ImageContent if screenshot requested,
     or a plain JSON string if no screenshot.
     """
-    text = _json(result.to_dict())
+    text = _json(_result_dict(result, tool, operation, backend))
 
     if not include_screenshot or ONLY_TEXT_FEEDBACK or not screenshot_data:
         return text
@@ -149,15 +201,25 @@ def _format_result(
 async def add_screenshot_if_available(
     result: CommandResult,
     include_screenshot: bool = False,
+    tool: str | None = None,
+    operation: str | None = None,
 ) -> list[TextContent | ImageContent] | str:
     """Conditionally append a screenshot to the result."""
     if not include_screenshot or ONLY_TEXT_FEEDBACK:
-        return _json(result.to_dict())
+        backend = await get_backend()
+        return _json(_result_dict(result, tool, operation, backend.name))
 
     backend = await get_backend()
     screenshot_result = await backend.get_screenshot()
 
     if screenshot_result.ok and screenshot_result.payload:
-        return _format_result(result, True, screenshot_result.payload)
+        return _format_result(
+            result,
+            True,
+            screenshot_result.payload,
+            tool,
+            operation,
+            backend.name,
+        )
 
-    return _json(result.to_dict())
+    return _json(_result_dict(result, tool, operation, backend.name))

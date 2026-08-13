@@ -32,7 +32,7 @@ class EzdxfBackend(AutoCADBackend):
 
     @property
     def capabilities(self) -> BackendCapabilities:
-        return BackendCapabilities(
+        caps = BackendCapabilities(
             can_read_drawing=True,
             can_modify_entities=True,
             can_create_entities=True,
@@ -44,6 +44,38 @@ class EzdxfBackend(AutoCADBackend):
             can_file_operations=True,
             can_undo=False,
         )
+        caps.operations = {
+                "drawing": [
+                    "create", "open", "info", "save", "save_as_dxf", "purge",
+                    "get_variables",
+                ],
+                "entity": [
+                    "create_line", "create_circle", "create_polyline", "create_rectangle",
+                    "create_arc", "create_ellipse", "create_mtext", "create_hatch",
+                    "list", "count", "get", "copy", "move", "rotate", "scale", "mirror",
+                    "array", "erase",
+                ],
+                "layer": [
+                    "list", "create", "set_current", "set_properties", "freeze", "thaw",
+                    "lock", "unlock",
+                ],
+                "block": [
+                    "list", "insert", "insert_with_attributes", "get_attributes",
+                    "update_attribute", "define",
+                ],
+                "annotation": [
+                    "create_text", "create_dimension_linear", "create_dimension_aligned",
+                    "create_dimension_angular", "create_dimension_radius", "create_leader",
+                ],
+                "pid": [
+                    "setup_layers", "insert_symbol", "list_symbols", "draw_process_line",
+                    "connect_equipment", "add_flow_arrow", "add_equipment_tag",
+                    "add_line_number", "insert_valve", "insert_instrument", "insert_pump",
+                    "insert_tank",
+                ],
+                "view": ["get_screenshot"],
+        }
+        return caps
 
     async def initialize(self) -> CommandResult:
         self._doc = ezdxf.new("R2013")

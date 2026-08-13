@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, ClassVar
 
 
 @dataclass
@@ -38,6 +38,13 @@ class BackendCapabilities:
     can_query_entities: bool = False
     can_file_operations: bool = False
     can_undo: bool = False
+    # Kept out of the dataclass fields so older consumers iterating __dict__
+    # continue to see only the original boolean capability flags.
+    operations: ClassVar[dict[str, list[str]]] = {}
+
+    def supports(self, tool: str, operation: str) -> bool:
+        """Return whether this backend advertises a specific operation."""
+        return operation in self.operations.get(tool, [])
 
 
 class AutoCADBackend(ABC):
