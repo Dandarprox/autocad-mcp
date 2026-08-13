@@ -20,14 +20,14 @@ class ScreenshotProvider(ABC):
     """Abstract screenshot provider."""
 
     @abstractmethod
-    def capture(self) -> str | None:
+    def capture(self, window: tuple[float, float, float, float] | None = None) -> str | None:
         """Return base64-encoded PNG, or None if capture fails."""
 
 
 class NullScreenshotProvider(ScreenshotProvider):
     """No-op provider — always returns None."""
 
-    def capture(self) -> str | None:
+    def capture(self, window: tuple[float, float, float, float] | None = None) -> str | None:
         return None
 
 
@@ -45,7 +45,7 @@ class MatplotlibScreenshotProvider(ScreenshotProvider):
     def doc(self, value: ezdxf.document.Drawing):
         self._doc = value
 
-    def capture(self) -> str | None:
+    def capture(self, window: tuple[float, float, float, float] | None = None) -> str | None:
         if self._doc is None:
             return None
         try:
@@ -62,6 +62,18 @@ class MatplotlibScreenshotProvider(ScreenshotProvider):
             ctx = RenderContext(self._doc)
             out = MatplotlibBackend(ax)
             Frontend(ctx, out).draw_layout(self._doc.modelspace())
+            if window:
+                x1, y1, x2, y2 = window
+                min_x, max_x = min(x1, x2), max(x1, x2)
+                min_y, max_y = min(y1, y2), max(y1, y2)
+                if min_x == max_x:
+                    min_x -= 1
+                    max_x += 1
+                if min_y == max_y:
+                    min_y -= 1
+                    max_y += 1
+                ax.set_xlim(min_x, max_x)
+                ax.set_ylim(min_y, max_y)
 
             buf = io.BytesIO()
             fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.1)
@@ -130,7 +142,7 @@ class Win32ScreenshotProvider(ScreenshotProvider):
 
         return win32gui.GetWindowRect(self._hwnd)
 
-    def capture(self) -> str | None:
+    def capture(self, window: tuple[float, float, float, float] | None = None) -> str | None:
         if sys.platform != "win32":
             return None
         try:

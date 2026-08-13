@@ -175,6 +175,31 @@ class AutoCADBackend(ABC):
     async def entity_chamfer(self, entity_id1: str, entity_id2: str, dist1: float, dist2: float) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
+    # --- Reference workspaces ---
+
+    async def reference_capture(
+        self,
+        mode: str = "all",
+        layers: list[str] | None = None,
+        window: list[float] | None = None,
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def reference_duplicate(
+        self,
+        handles: list[str],
+        dx: float,
+        dy: float,
+        target_layer: str,
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def reference_clear(self, handles: list[str]) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def reference_snapshot(self, window: list[float] | None = None) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
     # --- Layer operations ---
 
     async def layer_list(self) -> CommandResult:

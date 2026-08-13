@@ -118,6 +118,10 @@ class FileIPCBackend(AutoCADBackend):
                 ],
                 "view": ["zoom_extents", "zoom_window", "get_screenshot"],
                 "system": ["execute_lisp"],
+                "reference": [
+                    "capture", "inspect", "create_workspace", "duplicate", "snapshot",
+                    "clear_proposal", "reset",
+                ],
         }
         return caps
 
@@ -621,6 +625,36 @@ class FileIPCBackend(AutoCADBackend):
 
     async def drawing_open(self, path: str) -> CommandResult:
         return await self._dispatch("drawing-open", {"path": path})
+
+    # --- Reference workspaces ---
+
+    async def reference_capture(self, mode="all", layers=None, window=None) -> CommandResult:
+        return await self._dispatch("reference-capture", {
+            "mode": mode,
+            "layers_str": ";".join(layers or []),
+            "x1": window[0] if window else None,
+            "y1": window[1] if window else None,
+            "x2": window[2] if window else None,
+            "y2": window[3] if window else None,
+        })
+
+    async def reference_duplicate(self, handles, dx, dy, target_layer) -> CommandResult:
+        return await self._dispatch("reference-duplicate", {
+            "handles_str": ";".join(handles),
+            "dx": dx,
+            "dy": dy,
+            "target_layer": target_layer,
+        })
+
+    async def reference_clear(self, handles) -> CommandResult:
+        return await self._dispatch("reference-clear", {"handles_str": ";".join(handles)})
+
+    async def reference_snapshot(self, window=None) -> CommandResult:
+        if window:
+            zoom = await self.zoom_window(*window)
+            if not zoom.ok:
+                return await self.get_screenshot()
+        return await self.get_screenshot()
 
     # --- Undo / Redo ---
 

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import ezdxf
+from ezdxf import bbox as ezdxf_bbox
 import structlog
 
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
@@ -74,6 +75,10 @@ class EzdxfBackend(AutoCADBackend):
                     "insert_tank",
                 ],
                 "view": ["get_screenshot"],
+                "reference": [
+                    "capture", "inspect", "create_workspace", "duplicate", "snapshot",
+                    "clear_proposal", "reset",
+                ],
         }
         return caps
 
@@ -154,6 +159,102 @@ class EzdxfBackend(AutoCADBackend):
             return CommandResult(ok=True, payload={"path": path})
         except Exception as ex:
             return CommandResult(ok=False, error=str(ex))
+
+    # --- Reference workspaces ---
+
+    async def reference_capture(self, mode="all", layers=None, window=None) -> CommandResult:
+        entities = list(self._msp)
+        layer_set = set(layers or [])
+        if mode == "layer":
+            entities = [e for e in entities if e.dxf.get("layer", "0") in layer_set]
+        elif mode == "window":
+            if not window or len(window) != 4:
+                return CommandResult(ok=False, error="Reference window requires x1, y1, x2, y2")
+            x1, y1, x2, y2 = window
+            min_x, max_x = min(x1, x2), max(x1, x2)
+            min_y, max_y = min(y1, y2), max(y1, y2)
+            entities = [
+                e for e in entities
+                if self._entity_intersects_window(e, min_x, min_y, max_x, max_y)
+            ]
+        elif mode != "all":
+            return CommandResult(ok=False, error=f"Unknown reference capture mode: {mode}")
+
+        if not entities:
+            return CommandResult(ok=False, error="Reference contains no entities")
+        bounds = self._entities_bounds(entities)
+        if not bounds:
+            return CommandResult(ok=False, error="Reference entities have no measurable bounds")
+        return CommandResult(ok=True, payload={
+            "handles": [e.dxf.handle for e in entities if e.dxf.get("handle")],
+            "layers": sorted({e.dxf.get("layer", "0") for e in entities}),
+            "bounds": bounds,
+        })
+
+    async def reference_duplicate(self, handles, dx, dy, target_layer) -> CommandResult:
+        self._ensure_layer(target_layer)
+        copied_handles = []
+        handle_map = {}
+        for handle in handles:
+            entity = self._doc.entitydb.get(handle)
+            if entity is None:
+                continue
+            copied = entity.copy()
+            self._msp.add_entity(copied)
+            copied.translate(dx, dy, 0)
+            copied.dxf.layer = target_layer
+            copied_handles.append(copied.dxf.handle)
+            handle_map[str(handle)] = copied.dxf.handle
+        return CommandResult(ok=True, payload={
+            "copied_handles": copied_handles,
+            "handle_map": handle_map,
+            "count": len(copied_handles),
+        })
+
+    async def reference_clear(self, handles) -> CommandResult:
+        erased = []
+        for handle in handles:
+            entity = self._doc.entitydb.get(handle)
+            if entity is not None:
+                self._msp.delete_entity(entity)
+                erased.append(str(handle))
+        return CommandResult(ok=True, payload={"erased": erased, "count": len(erased)})
+
+    async def reference_snapshot(self, window=None) -> CommandResult:
+        bounds = None
+        if window:
+            bounds = tuple(float(value) for value in window)
+        data = self._screenshot.capture(bounds)
+        if data:
+            return CommandResult(ok=True, payload=data)
+        return CommandResult(ok=False, error="Reference snapshot render failed")
+
+    @staticmethod
+    def _entity_box(entity):
+        try:
+            box = ezdxf_bbox.extents([entity], fast=True)
+            if box.has_data:
+                return box.extmin.x, box.extmin.y, box.extmax.x, box.extmax.y
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def _entities_bounds(cls, entities):
+        boxes = [box for entity in entities if (box := cls._entity_box(entity))]
+        if not boxes:
+            return None
+        return {
+            "min_x": min(box[0] for box in boxes),
+            "min_y": min(box[1] for box in boxes),
+            "max_x": max(box[2] for box in boxes),
+            "max_y": max(box[3] for box in boxes),
+        }
+
+    @classmethod
+    def _entity_intersects_window(cls, entity, min_x, min_y, max_x, max_y):
+        box = cls._entity_box(entity)
+        return bool(box and box[2] >= min_x and box[0] <= max_x and box[3] >= min_y and box[1] <= max_y)
 
     async def drawing_get_variables(self, names: list[str] | None = None) -> CommandResult:
         if not self._doc:

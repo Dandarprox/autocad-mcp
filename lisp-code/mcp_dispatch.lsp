@@ -288,16 +288,26 @@
      (command "_.ZOOM" "_E")
      (cons T "\"zoomed to extents\""))
 
-    ((= cmd-name "zoom-window")
-     (progn
+     ((= cmd-name "zoom-window")
+      (progn
        (setq x1 (mcp-json-get-number params-json "x1"))
        (setq y1 (mcp-json-get-number params-json "y1"))
        (setq x2 (mcp-json-get-number params-json "x2"))
        (setq y2 (mcp-json-get-number params-json "y2"))
-       (command "_.ZOOM" "_W" (list x1 y1 0) (list x2 y2 0))
-       (cons T "\"zoomed to window\"")))
+        (command "_.ZOOM" "_W" (list x1 y1 0) (list x2 y2 0))
+        (cons T "\"zoomed to window\"")))
 
-    ;; --- Drawing file ops ---
+     ;; --- Reference workspaces ---
+     ((= cmd-name "reference-capture")
+      (mcp-cmd-reference-capture params-json))
+
+     ((= cmd-name "reference-duplicate")
+      (mcp-cmd-reference-duplicate params-json))
+
+     ((= cmd-name "reference-clear")
+      (mcp-cmd-reference-clear params-json))
+
+     ;; --- Drawing file ops ---
     ((= cmd-name "drawing-save")
      (progn
        (setq path (mcp-json-get-string params-json "path"))
@@ -1295,6 +1305,168 @@
     )
     (cons nil (strcat "Block '" name "' not found"))
   )
+)
+
+;; --- Reference workspace operations ---
+
+(defun mcp-ref-update-point (pt)
+  "Update the temporary reference bounds with a point."
+  (if (and pt (listp pt))
+    (progn
+      (if (not *mcp-ref-min-x*) (setq *mcp-ref-min-x* (car pt))
+        (setq *mcp-ref-min-x* (min *mcp-ref-min-x* (car pt))))
+      (if (not *mcp-ref-min-y*) (setq *mcp-ref-min-y* (cadr pt))
+        (setq *mcp-ref-min-y* (min *mcp-ref-min-y* (cadr pt))))
+      (if (not *mcp-ref-max-x*) (setq *mcp-ref-max-x* (car pt))
+        (setq *mcp-ref-max-x* (max *mcp-ref-max-x* (car pt))))
+      (if (not *mcp-ref-max-y*) (setq *mcp-ref-max-y* (cadr pt))
+        (setq *mcp-ref-max-y* (max *mcp-ref-max-y* (cadr pt))))
+    )
+  )
+)
+
+(defun mcp-ref-replace-semicolons (str / result i ch)
+  "Convert semicolon-delimited values to comma-delimited values."
+  (setq result "" i 1)
+  (while (<= i (strlen str))
+    (setq ch (substr str i 1))
+    (if (= ch ";") (setq result (strcat result ","))
+      (setq result (strcat result ch)))
+    (setq i (1+ i))
+  )
+  result
+)
+
+(defun mcp-ref-scan-entity (ent / data item center radius)
+  "Scan common entity point data for a usable reference boundary."
+  (setq data (entget ent))
+  (foreach item data
+    (if (and (member (car item) '(10 11)) (= (type (cdr item)) 'LIST))
+      (mcp-ref-update-point (cdr item))
+    )
+  )
+  (if (= (cdr (assoc 0 data)) "CIRCLE")
+    (progn
+      (setq center (cdr (assoc 10 data)))
+      (setq radius (cdr (assoc 40 data)))
+      (if center
+        (progn
+          (mcp-ref-update-point (list (- (car center) radius) (- (cadr center) radius) 0.0))
+          (mcp-ref-update-point (list (+ (car center) radius) (+ (cadr center) radius) 0.0))
+        )
+      )
+    )
+  )
+)
+
+(defun mcp-cmd-reference-capture (params / mode layers-str x1 y1 x2 y2 ss i ent data handle layer handles layers)
+  "Capture handles, layers, and approximate bounds for a reference region."
+  (setq mode (mcp-json-get-string params "mode"))
+  (if (not mode) (setq mode "all"))
+  (setq layers-str (mcp-json-get-string params "layers_str"))
+  (setq x1 (mcp-json-get-number params "x1"))
+  (setq y1 (mcp-json-get-number params "y1"))
+  (setq x2 (mcp-json-get-number params "x2"))
+  (setq y2 (mcp-json-get-number params "y2"))
+  (setq ss nil)
+  (cond
+    ((= mode "all") (setq ss (ssget "_X")))
+    ((= mode "layer")
+      (if layers-str
+        (setq ss (ssget "_X" (list (cons 8 (mcp-ref-replace-semicolons layers-str)))))
+      )
+    )
+    ((= mode "window")
+      (if (and x1 y1 x2 y2)
+        (setq ss (ssget "_W" (list (min x1 x2) (min y1 y2) 0.0)
+                           (list (max x1 x2) (max y1 y2) 0.0)))
+      )
+    )
+  )
+  (if (not ss)
+    (cons nil "Reference contains no entities")
+    (progn
+      (setq *mcp-ref-min-x* nil *mcp-ref-min-y* nil
+            *mcp-ref-max-x* nil *mcp-ref-max-y* nil)
+      (setq handles "" layers "" i 0)
+      (while (< i (sslength ss))
+        (setq ent (ssname ss i) data (entget ent))
+        (setq handle (cdr (assoc 5 data)) layer (cdr (assoc 8 data)))
+        (if handle
+          (setq handles (strcat handles (if (> (strlen handles) 0) "," "")
+                                "\"" handle "\""))
+        )
+        (if (and layer (not (vl-string-search (strcat "\"" layer "\"") layers)))
+          (setq layers (strcat layers (if (> (strlen layers) 0) "," "")
+                               "\"" layer "\""))
+        )
+        (mcp-ref-scan-entity ent)
+        (setq i (1+ i))
+      )
+      (if (not *mcp-ref-min-x*)
+        (cons nil "Reference entities have no measurable bounds")
+        (cons T (strcat
+          "{\"handles\":[" handles "],\"layers\":[" layers "],\"bounds\":{"
+          "\"min_x\":" (rtos *mcp-ref-min-x* 2 8)
+          ",\"min_y\":" (rtos *mcp-ref-min-y* 2 8)
+          ",\"max_x\":" (rtos *mcp-ref-max-x* 2 8)
+          ",\"max_y\":" (rtos *mcp-ref-max-y* 2 8) "}}"))
+      )
+    )
+  )
+)
+
+(defun mcp-cmd-reference-duplicate (params / handles-str target-layer dx dy handles handle ent new-ent new-handle copied map copy-count)
+  "Copy reference handles by a translation and assign a proposal layer."
+  (setq handles-str (mcp-json-get-string params "handles_str"))
+  (setq target-layer (mcp-json-get-string params "target_layer"))
+  (setq dx (mcp-json-get-number params "dx"))
+  (setq dy (mcp-json-get-number params "dy"))
+  (if (not dx) (setq dx 0.0))
+  (if (not dy) (setq dy 0.0))
+  (if (not handles-str)
+    (cons nil "handles_str is required")
+    (progn
+      (setq handles (mcp-split-string handles-str ";") copied "" map "" copy-count 0)
+      (foreach handle handles
+        (setq ent (handent handle))
+        (if ent
+          (progn
+            (command "_.COPY" ent "" '(0 0 0) (list dx dy 0.0))
+            (setq new-ent (entlast) new-handle (cdr (assoc 5 (entget new-ent))))
+            (if target-layer
+              (progn
+                (ensure_layer_exists target-layer "white" "CONTINUOUS")
+                (entmod (subst (cons 8 target-layer) (assoc 8 (entget new-ent)) (entget new-ent)))
+              )
+            )
+            (setq copied (strcat copied (if (> (strlen copied) 0) "," "") "\"" new-handle "\""))
+            (setq map (strcat map (if (> (strlen map) 0) "," "")
+                           "\"" handle "\":\"" new-handle "\""))
+            (setq copy-count (1+ copy-count))
+          )
+        )
+      )
+      (cons T (strcat "{\"copied_handles\":[" copied "],\"handle_map\":{" map "},\"count\":"
+                      (itoa copy-count) "}"))
+    )
+  )
+)
+
+(defun mcp-cmd-reference-clear (params / handles-str handles handle ent erased)
+  "Erase only explicitly tracked proposal handles."
+  (setq handles-str (mcp-json-get-string params "handles_str"))
+  (setq erased "" handles (if handles-str (mcp-split-string handles-str ";") '()))
+  (foreach handle handles
+    (setq ent (handent handle))
+    (if ent
+      (progn
+        (entdel ent)
+        (setq erased (strcat erased (if (> (strlen erased) 0) "," "") "\"" handle "\""))
+      )
+    )
+  )
+  (cons T (strcat "{\"erased\":[" erased "],\"count\":" (itoa (length handles)) "}"))
 )
 
 ;; -----------------------------------------------------------------------

@@ -1,6 +1,6 @@
-"""AutoCAD MCP Server v3.1 — 8 consolidated tools with operation dispatch.
+"""AutoCAD MCP Server v3.1 — consolidated tools with operation dispatch.
 
-Tools: drawing, entity, layer, block, annotation, pid, view, system
+Tools: drawing, entity, layer, block, annotation, pid, reference, view, system
 """
 
 from __future__ import annotations
@@ -24,11 +24,14 @@ from autocad_mcp.contracts import (
     EntityOperation,
     LayerOperation,
     PIDOperation,
+    ReferenceOperation,
     SystemOperation,
     ViewOperation,
     ensure_supported,
     validate_operation,
 )
+from autocad_mcp.config import ONLY_TEXT_FEEDBACK
+from autocad_mcp import reference as reference_state
 
 # FastMCP validates return types via Pydantic. Tools that may return
 # ImageContent (screenshot) alongside TextContent need a union return type.
@@ -135,6 +138,7 @@ async def entity(
     points: list[list[float]] | None = None,
     layer: str | None = None,
     entity_id: str | None = None,
+    workspace_id: str | None = None,
     data: dict | None = None,
     include_screenshot: bool = False,
 ) -> ToolResult:
@@ -166,6 +170,9 @@ async def entity(
       fillet  — data: {id1, id2, radius}
       chamfer — data: {id1, id2, dist1, dist2}
       erase   — entity_id
+
+    Workspace-aware calls pass workspace_id to default new entities to the
+    proposal layer and protect captured reference entities from mutation.
     """
     backend = await get_backend()
     ensure_supported(backend, "entity", operation)
@@ -188,6 +195,13 @@ async def entity(
     points = data.get("points", points)
     layer = data.get("layer", layer)
     entity_id = data.get("entity_id", entity_id)
+    data = reference_state.apply_entity_context(
+        data,
+        workspace_id,
+        entity_id,
+        mutates_entity=operation not in {"list", "count", "get"},
+    )
+    layer = data.get("layer", layer)
 
     # --- Create ---
     if operation == "create_line":
@@ -237,6 +251,7 @@ async def entity(
     else:
         return _unknown("entity", operation)
 
+    reference_state.record_handles(workspace_id, result.payload)
     return await add_screenshot_if_available(result, include_screenshot, "entity", operation)
 
 
@@ -352,6 +367,7 @@ async def block(
 async def annotation(
     operation: AnnotationOperation,
     data: dict | None = None,
+    workspace_id: str | None = None,
     include_screenshot: bool = False,
 ) -> ToolResult:
     """Annotation: text, dimensions, and leaders.
@@ -368,6 +384,7 @@ async def annotation(
     backend = await get_backend()
     ensure_supported(backend, "annotation", operation)
     data = _validate("annotation", operation, data)
+    data = reference_state.apply_entity_context(data, workspace_id, mutates_entity=True)
 
     if operation == "create_text":
         result = await backend.create_text(
@@ -395,6 +412,7 @@ async def annotation(
     else:
         return _unknown("annotation", operation)
 
+    reference_state.record_handles(workspace_id, result.payload)
     return await add_screenshot_if_available(result, include_screenshot, "annotation", operation)
 
 
@@ -477,7 +495,136 @@ async def pid(
 
 
 # ==========================================================================
-# 7. view — Viewport and screenshot
+# 7. reference — protected reference workspaces
+# ==========================================================================
+
+
+@mcp.tool(annotations={"title": "AutoCAD Reference Workspace", "readOnlyHint": False})
+@_safe("reference")
+async def reference(
+    operation: ReferenceOperation,
+    data: dict | None = None,
+) -> ToolResult:
+    """Capture and manage protected reference/proposal workspaces.
+
+    Operations:
+      capture          — data: {mode: all|layer|window, layers?, x1?, y1?, x2?, y2?}
+      inspect          — Return the active workspace summary.
+      create_workspace — data: {mode: side_by_side|duplicate_then_modify|overlay, gap?}
+      duplicate        — Copy the reference into the proposal area.
+      snapshot         — data: {target?, x1?, y1?, x2?, y2?}; attach an image.
+      clear_proposal   — Erase tracked proposal entities only.
+      reset            — Forget workspace state without changing the drawing.
+    """
+    data = _validate("reference", operation, data)
+
+    if operation == "reset":
+        reference_state.reset()
+        return _json({"ok": True, "payload": {"reset": True}})
+
+    if operation == "inspect":
+        workspace = reference_state.require(data.get("workspace_id"))
+        return _json({"ok": True, "payload": workspace.summary()})
+
+    backend = await get_backend()
+
+    if operation == "capture":
+        mode = data.get("mode", "all")
+        layers = data.get("layers") or []
+        window = _reference_window(data) if mode == "window" else None
+        if mode == "layer" and not layers:
+            raise reference_state.ReferenceError(
+                "invalid_reference_boundary", "Layer capture requires at least one layer"
+            )
+        if mode == "window" and window is None:
+            raise reference_state.ReferenceError(
+                "invalid_reference_boundary", "Window capture requires x1, y1, x2, y2"
+            )
+        ensure_supported(backend, "reference", operation)
+        result = await backend.reference_capture(mode, layers, window)
+        if not result.ok:
+            return _json(_result_dict(result, "reference", operation, backend.name))
+        workspace = reference_state.capture(result.payload or {})
+        return _json({"ok": True, "payload": workspace.summary()})
+
+    if operation == "create_workspace":
+        ensure_supported(backend, "reference", operation)
+        workspace = reference_state.create_workspace(data["mode"], data.get("gap", 20.0))
+        layer_result = await backend.layer_create(workspace.proposal_layer)
+        if not layer_result.ok:
+            return _json(_result_dict(layer_result, "reference", operation, backend.name))
+        return _json({"ok": True, "payload": workspace.summary()})
+
+    workspace = reference_state.require(data.get("workspace_id"), require_mode=True)
+
+    if operation == "duplicate":
+        ensure_supported(backend, "reference", operation)
+        result = await backend.reference_duplicate(
+            workspace.handles,
+            workspace.dx,
+            workspace.dy,
+            workspace.proposal_layer,
+        )
+        if not result.ok:
+            return _json(_result_dict(result, "reference", operation, backend.name))
+        reference_state.record_handles(workspace.workspace_id, result.payload)
+        return _json({
+            "ok": True,
+            "payload": {**workspace.summary(), "duplicate": result.payload},
+        })
+
+    if operation == "clear_proposal":
+        ensure_supported(backend, "reference", operation)
+        if not workspace.proposal_handles:
+            raise reference_state.ReferenceError("proposal_not_found", "No proposal entities are tracked")
+        result = await backend.reference_clear(workspace.proposal_handles)
+        if not result.ok:
+            return _json(_result_dict(result, "reference", operation, backend.name))
+        workspace.proposal_handles.clear()
+        return _json({"ok": True, "payload": {**workspace.summary(), "cleared": result.payload}})
+
+    if operation == "snapshot":
+        ensure_supported(backend, "reference", operation)
+        target = data.get("target", "reference")
+        window = _reference_window(data) if target == "window" else None
+        bounds = reference_state.bounds_for(target, window)
+        result = await backend.reference_snapshot([
+            bounds["min_x"], bounds["min_y"], bounds["max_x"], bounds["max_y"],
+        ])
+        fallback = False
+        if not result.ok:
+            result = await backend.get_screenshot()
+            fallback = True
+        if not result.ok or not result.payload:
+            return _json(_result_dict(result, "reference", operation, backend.name))
+        metadata = {
+            "workspace_id": workspace.workspace_id,
+            "bounds": bounds,
+            "source": "model_space" if backend.name == "ezdxf" and not fallback else "viewport",
+            "fallback": fallback,
+            "image": "attached" if not ONLY_TEXT_FEEDBACK else "suppressed",
+        }
+        if ONLY_TEXT_FEEDBACK:
+            return _json({"ok": True, "payload": metadata})
+        from mcp.types import ImageContent, TextContent
+
+        return [
+            TextContent(type="text", text=_json({"ok": True, "payload": metadata})),
+            ImageContent(type="image", data=result.payload, mimeType="image/png"),
+        ]
+
+    return _unknown("reference", operation)
+
+
+def _reference_window(data: dict) -> list[float] | None:
+    values = [data.get("x1"), data.get("y1"), data.get("x2"), data.get("y2")]
+    if any(value is None for value in values):
+        return None
+    return [float(value) for value in values]
+
+
+# ==========================================================================
+# 8. view — Viewport and screenshot
 # ==========================================================================
 
 
@@ -526,7 +673,7 @@ async def view(
 
 
 # ==========================================================================
-# 8. system — Server management
+# 9. system — Server management
 # ==========================================================================
 
 
@@ -553,6 +700,10 @@ async def system(
     if operation == "status" or operation == "get_backend":
         backend = await get_backend()
         result = await backend.status()
+        if result.ok and isinstance(result.payload, dict):
+            result.payload["reference_workspace"] = (
+                reference_state.active().summary() if reference_state.active() else None
+            )
         return await add_screenshot_if_available(result, include_screenshot, "system", operation)
     elif operation == "health":
         try:

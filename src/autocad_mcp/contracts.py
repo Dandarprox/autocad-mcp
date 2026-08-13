@@ -232,6 +232,34 @@ class CodePayload(Payload):
     code: str = Field(min_length=1)
 
 
+class ReferenceCapturePayload(Payload):
+    mode: Literal["all", "layer", "window"] = "all"
+    layers: list[str] | None = None
+    x1: float | None = None
+    y1: float | None = None
+    x2: float | None = None
+    y2: float | None = None
+
+
+class ReferenceWorkspacePayload(Payload):
+    mode: Literal["side_by_side", "duplicate_then_modify", "overlay"]
+    gap: float = Field(default=20.0, ge=0)
+    workspace_id: str | None = None
+
+
+class ReferenceSnapshotPayload(Payload):
+    target: Literal["reference", "proposal", "workspace", "window"] = "reference"
+    workspace_id: str | None = None
+    x1: float | None = None
+    y1: float | None = None
+    x2: float | None = None
+    y2: float | None = None
+
+
+class ReferenceWorkspaceIDPayload(Payload):
+    workspace_id: str | None = None
+
+
 DrawingOperation = Literal[
     "create", "open", "info", "save", "save_as_dxf", "plot_pdf", "purge",
     "get_variables", "undo", "redo",
@@ -262,6 +290,10 @@ PIDOperation = Literal[
 ViewOperation = Literal["zoom_extents", "zoom_window", "get_screenshot"]
 SystemOperation = Literal[
     "status", "health", "get_backend", "runtime", "init", "execute_lisp",
+]
+ReferenceOperation = Literal[
+    "capture", "inspect", "create_workspace", "duplicate", "snapshot",
+    "clear_proposal", "reset",
 ]
 
 
@@ -317,6 +349,14 @@ CONTRACTS: dict[str, dict[str, type[Payload]]] = {
     },
     "view": {"zoom_window": WindowPayload},
     "system": {"execute_lisp": CodePayload},
+    "reference": {
+        "capture": ReferenceCapturePayload,
+        "create_workspace": ReferenceWorkspacePayload,
+        "snapshot": ReferenceSnapshotPayload,
+        "duplicate": ReferenceWorkspaceIDPayload,
+        "clear_proposal": ReferenceWorkspaceIDPayload,
+        "reset": EmptyPayload,
+    },
 }
 
 

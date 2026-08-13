@@ -9,7 +9,7 @@ Two backends, one API:
 | **File IPC** | Windows Python | Yes — AutoCAD LT 2024+ (Windows) | Win32 PrintWindow |
 | **ezdxf** | Any platform | No (headless) | matplotlib render |
 
-The server exposes **8 consolidated tools** (`drawing`, `entity`, `layer`, `block`, `annotation`, `pid`, `view`, `system`) over the MCP stdio transport. An MCP client (Claude Desktop, Claude Code, etc.) connects and drives AutoCAD through natural-language requests.
+The server exposes **9 consolidated tools** (`drawing`, `entity`, `layer`, `block`, `annotation`, `pid`, `reference`, `view`, `system`) over the MCP stdio transport. An MCP client (Claude Desktop, Claude Code, etc.) connects and drives AutoCAD through natural-language requests.
 
 ## Prerequisites (File IPC backend)
 
@@ -150,6 +150,14 @@ include an `error_code`, `tool`, `operation`, and `backend` when available.
 `setup_layers`, `insert_symbol`, `list_symbols`, `draw_process_line`, `connect_equipment`, `add_flow_arrow`, `add_equipment_tag`, `add_line_number`, `insert_valve`, `insert_instrument`, `insert_pump`, `insert_tank`
 
 > P&ID symbol insertion requires the [CAD Tools Online](https://www.cadtoolsonline.com/) (CTO) P&ID Symbol Library installed at `C:\PIDv4-CTO\`. The ezdxf backend has built-in CTO library support. For the File IPC backend, some P&ID operations require additional LISP helpers — see the P&ID section in the wiki for setup details.
+
+### `reference` — Protected reference workspaces
+
+Use `capture` to mark the current drawing, a layer set, or a window as a
+reference. `create_workspace` supports `side_by_side`, `duplicate_then_modify`,
+and `overlay` modes. Workspace-aware entities use a proposal layer, captured
+reference handles are protected, and `snapshot` explicitly returns a visual
+crop with coordinate metadata.
 
 ### `view` — Viewport and screenshot
 
