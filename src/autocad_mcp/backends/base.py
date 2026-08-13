@@ -14,6 +14,7 @@ class CommandResult:
     ok: bool
     payload: Any = None
     error: str | None = None
+    details: dict[str, Any] | None = None
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {"ok": self.ok}
@@ -21,6 +22,8 @@ class CommandResult:
             d["payload"] = self.payload
         else:
             d["error"] = self.error
+            if self.details:
+                d["details"] = self.details
         return d
 
 

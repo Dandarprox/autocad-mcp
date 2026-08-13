@@ -7,12 +7,16 @@ Covers:
 """
 
 import tempfile
+import json
+import os
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 from autocad_mcp.backends.base import CommandResult
+from autocad_mcp.backends import file_ipc
 from autocad_mcp.backends.file_ipc import FileIPCBackend
 
 
@@ -21,18 +25,95 @@ class TestCleanupStaleCommands:
         backend = FileIPCBackend()
         with tempfile.TemporaryDirectory() as tmpdir:
             backend._ipc_dir = Path(tmpdir)
-            (Path(tmpdir) / "autocad_mcp_cmd_aaa.json").write_text("{}")
-            (Path(tmpdir) / "autocad_mcp_cmd_bbb.json").write_text("{}")
-            (Path(tmpdir) / "autocad_mcp_result_aaa.json").write_text("{}")
-            (Path(tmpdir) / "autocad_mcp_lisp_aaa.lsp").write_text("(+ 1 2)")
+            session = backend._session_id
+            (Path(tmpdir) / f"autocad_mcp_cmd_{session}_aaa.json").write_text("{}")
+            (Path(tmpdir) / "autocad_mcp_cmd_other_bbb.json").write_text("{}")
+            (Path(tmpdir) / f"autocad_mcp_result_{session}_aaa.json").write_text("{}")
+            (Path(tmpdir) / f"autocad_mcp_lisp_{session}_aaa.lsp").write_text("(+ 1 2)")
 
             backend._cleanup_stale_commands()
 
-            assert not (Path(tmpdir) / "autocad_mcp_cmd_aaa.json").exists()
-            assert not (Path(tmpdir) / "autocad_mcp_cmd_bbb.json").exists()
-            # result and lisp files must be preserved
-            assert (Path(tmpdir) / "autocad_mcp_result_aaa.json").exists()
-            assert (Path(tmpdir) / "autocad_mcp_lisp_aaa.lsp").exists()
+            assert not (Path(tmpdir) / f"autocad_mcp_cmd_{session}_aaa.json").exists()
+            assert (Path(tmpdir) / "autocad_mcp_cmd_other_bbb.json").exists()
+            assert (Path(tmpdir) / f"autocad_mcp_result_{session}_aaa.json").exists()
+            assert (Path(tmpdir) / f"autocad_mcp_lisp_{session}_aaa.lsp").exists()
+
+
+class TestDispatchLease:
+    @pytest.mark.asyncio
+    async def test_lease_serializes_processes_and_checks_ownership(self):
+        first = FileIPCBackend()
+        second = FileIPCBackend()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first._ipc_dir = Path(tmpdir)
+            second._ipc_dir = Path(tmpdir)
+
+            acquired = await first._acquire_dispatch_lease("first_request", "ping")
+            assert acquired["acquired"] is True
+            assert second._read_dispatch_lease()["session_id"] == first._session_id
+
+            second._release_dispatch_lease()
+            assert first._lease_path().exists()
+
+            first._release_dispatch_lease()
+            acquired = await second._acquire_dispatch_lease("second_request", "ping")
+            assert acquired["acquired"] is True
+            second._release_dispatch_lease()
+
+    @pytest.mark.asyncio
+    async def test_stale_lease_reclaims_only_abandoned_session(self):
+        backend = FileIPCBackend()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend._ipc_dir = Path(tmpdir)
+            dead_session = "dead_session"
+            lease_path = backend._lease_path()
+            lease_path.write_text(json.dumps({"session_id": dead_session}), encoding="utf-8")
+            old_time = time.time() - file_ipc.LEASE_STALE_THRESHOLD - 1
+            os.utime(lease_path, (old_time, old_time))
+            abandoned = Path(tmpdir) / f"autocad_mcp_cmd_{dead_session}_old.json"
+            abandoned.write_text("{}")
+            unrelated = Path(tmpdir) / "autocad_mcp_cmd_other_live.json"
+            unrelated.write_text("{}")
+
+            acquired = await backend._acquire_dispatch_lease("new_request", "ping")
+
+            assert acquired["acquired"] is True
+            assert acquired["reclaimed"] is True
+            assert not abandoned.exists()
+            assert unrelated.exists()
+            backend._release_dispatch_lease()
+
+    @pytest.mark.asyncio
+    async def test_result_timeout_includes_phase_diagnostics(self, monkeypatch):
+        backend = FileIPCBackend()
+        backend._type_dispatch_trigger = lambda: True
+        backend._send_esc = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend._ipc_dir = Path(tmpdir)
+            monkeypatch.setattr(file_ipc, "TIMEOUT", 0.01)
+            monkeypatch.setattr(file_ipc, "POLL_INTERVAL", 0.001)
+
+            result = await backend._dispatch_unlocked("ping", {})
+
+            assert result.ok is False
+            assert result.details["phase"] == "result_poll"
+            assert result.details["request_id"].startswith(backend._session_id)
+            assert result.details["recovery_sent"] is True
+
+    @pytest.mark.asyncio
+    async def test_lease_wait_timeout_is_distinct(self, monkeypatch):
+        backend = FileIPCBackend()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend._ipc_dir = Path(tmpdir)
+            backend._lease_path().write_text(json.dumps({"session_id": "live"}), encoding="utf-8")
+            monkeypatch.setattr(file_ipc, "TIMEOUT", 0.01)
+            monkeypatch.setattr(file_ipc, "POLL_INTERVAL", 0.001)
+
+            result = await backend._dispatch_unlocked("ping", {})
+
+            assert result.ok is False
+            assert result.details["phase"] == "lease_wait"
+            assert result.details["lease_wait_seconds"] >= 0
 
 
 class TestDispatchTriggerRecovery:

@@ -194,6 +194,11 @@ The File IPC backend sends keystrokes to AutoCAD's MDIClient window via `PostMes
 
 > **Note:** If you change `AUTOCAD_MCP_IPC_DIR`, you must also update the `*mcp-ipc-dir*` variable in `mcp_dispatch.lsp` to match.
 
+File IPC requests are session-scoped and coordinate through a shared dispatch
+lease. This allows multiple MCP server processes to use the same IPC directory
+without deleting each other's active command files. Timeout responses include
+the request phase and recovery details.
+
 ## Development
 
 ```powershell

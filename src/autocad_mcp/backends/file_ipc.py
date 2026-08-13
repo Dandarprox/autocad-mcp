@@ -29,6 +29,8 @@ log = structlog.get_logger()
 POLL_INTERVAL = 0.1  # seconds
 TIMEOUT = IPC_TIMEOUT  # seconds (configurable via AUTOCAD_MCP_IPC_TIMEOUT)
 STALE_THRESHOLD = 60.0  # clean up files older than this
+LEASE_FILENAME = "autocad_mcp_dispatch.lock"
+LEASE_STALE_THRESHOLD = max(5.0, POLL_INTERVAL * 20)
 
 
 def find_autocad_window() -> int | None:
@@ -57,6 +59,7 @@ class FileIPCBackend(AutoCADBackend):
     """File-based IPC with AutoCAD LT via mcp_dispatch.lsp."""
 
     def __init__(self):
+        self._session_id = uuid.uuid4().hex[:12]
         self._hwnd: int | None = None
         self._command_hwnd: int | None = None
         self._ipc_dir = Path(IPC_DIR)
@@ -64,6 +67,7 @@ class FileIPCBackend(AutoCADBackend):
         self._lock = asyncio.Lock()  # Single in-flight command
         self._needs_recovery = False  # Set when a dispatch times out
         self._escape_targets: list[int] = []  # HWNDs used for ESC cancellation
+        self._lease_token: str | None = None
 
     @property
     def name(self) -> str:
@@ -188,6 +192,9 @@ class FileIPCBackend(AutoCADBackend):
             "backend": "file_ipc",
             "hwnd": self._hwnd,
             "ipc_dir": str(self._ipc_dir),
+            "session_id": self._session_id,
+            "lease_file": str(self._lease_path()),
+            "lease_owned": self._lease_token is not None,
             "capabilities": {k: v for k, v in self.capabilities.__dict__.items()},
         }
         return CommandResult(ok=True, payload=info)
@@ -201,18 +208,34 @@ class FileIPCBackend(AutoCADBackend):
 
     async def _dispatch_unlocked(self, command: str, params: dict) -> CommandResult:
         """Core IPC logic (must be called under _lock)."""
-        request_id = uuid.uuid4().hex[:12]
+        started = time.monotonic()
+        request_id = f"{self._session_id}_{uuid.uuid4().hex[:12]}"
         cmd_file = self._ipc_dir / f"autocad_mcp_cmd_{request_id}.json"
         result_file = self._ipc_dir / f"autocad_mcp_result_{request_id}.json"
         tmp_file = cmd_file.with_suffix(".tmp")
+        lease = await self._acquire_dispatch_lease(request_id, command)
+        if not lease["acquired"]:
+            return CommandResult(
+                ok=False,
+                error="IPC dispatch lease timeout",
+                details={
+                    "phase": "lease_wait",
+                    "session_id": self._session_id,
+                    "request_id": request_id,
+                    "command": command,
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                    "timeout_seconds": TIMEOUT,
+                    "lease_wait_seconds": lease["waited_seconds"],
+                    "lease_reclaimed": lease["reclaimed"],
+                },
+            )
 
+        result_seen = False
+        malformed_results = 0
+        recovery_sent = False
         try:
             # Strip None values — the simple LISP JSON parser can't handle null
             clean_params = {k: v for k, v in params.items() if v is not None}
-
-            # Remove leftover command files from previously timed-out dispatches
-            # so the LISP dispatcher never picks up a stale request.
-            self._cleanup_stale_commands()
 
             # Atomic write: write to .tmp, then rename
             payload = {
@@ -221,16 +244,58 @@ class FileIPCBackend(AutoCADBackend):
                 "params": clean_params,
                 "ts": time.time(),
             }
-            tmp_file.write_text(json.dumps(payload), encoding="utf-8")
-            tmp_file.rename(cmd_file)
+            try:
+                tmp_file.write_text(json.dumps(payload), encoding="utf-8")
+                tmp_file.rename(cmd_file)
+            except OSError as exc:
+                return CommandResult(
+                    ok=False,
+                    error=f"IPC command file write failed: {exc}",
+                    details={
+                        "phase": "command_write",
+                        "session_id": self._session_id,
+                        "request_id": request_id,
+                        "command": command,
+                        "elapsed_seconds": round(time.monotonic() - started, 3),
+                        "lease_reclaimed": lease["reclaimed"],
+                    },
+                )
 
             # Type the fixed dispatch trigger
-            self._type_dispatch_trigger()
+            if not self._type_dispatch_trigger():
+                return CommandResult(
+                    ok=False,
+                    error="Could not trigger AutoCAD dispatcher",
+                    details={
+                        "phase": "dispatch_trigger",
+                        "session_id": self._session_id,
+                        "request_id": request_id,
+                        "command": command,
+                        "elapsed_seconds": round(time.monotonic() - started, 3),
+                        "lease_reclaimed": lease["reclaimed"],
+                    },
+                )
 
             # Poll for result
             deadline = time.time() + TIMEOUT
             while time.time() < deadline:
+                if not self._refresh_dispatch_lease():
+                    return CommandResult(
+                        ok=False,
+                        error="IPC dispatch lease was lost",
+                        details={
+                            "phase": "recovery",
+                            "session_id": self._session_id,
+                            "request_id": request_id,
+                            "command": command,
+                            "elapsed_seconds": round(time.monotonic() - started, 3),
+                            "timeout_seconds": TIMEOUT,
+                            "result_seen": result_seen,
+                            "malformed_results": malformed_results,
+                        },
+                    )
                 if result_file.exists():
+                    result_seen = True
                     try:
                         # AutoCAD LISP writes files in Windows-1252 encoding;
                         # try UTF-8 first (covers ASCII), fall back to cp1252
@@ -245,17 +310,34 @@ class FileIPCBackend(AutoCADBackend):
                                 ok=data.get("ok", False),
                                 payload=data.get("payload"),
                                 error=data.get("error"),
+                                details=data.get("details"),
                             )
                     except (json.JSONDecodeError, OSError):
-                        pass  # File may be partially written, retry
+                        malformed_results += 1  # File may be partially written, retry
                 await asyncio.sleep(POLL_INTERVAL)
 
             # Timeout: clear any stuck command and flag recovery for the next
             # dispatch so the cascade of failures stops here.
             self._needs_recovery = True
             self._send_esc(count=3)
+            recovery_sent = True
             log.warning("dispatch_timeout", request_id=request_id, command=command)
-            return CommandResult(ok=False, error=f"Timeout waiting for result (request_id={request_id})")
+            return CommandResult(
+                ok=False,
+                error=f"Timeout waiting for result (request_id={request_id})",
+                details={
+                    "phase": "result_poll",
+                    "session_id": self._session_id,
+                    "request_id": request_id,
+                    "command": command,
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                    "timeout_seconds": TIMEOUT,
+                    "result_seen": result_seen,
+                    "malformed_results": malformed_results,
+                    "recovery_sent": recovery_sent,
+                    "lease_reclaimed": lease["reclaimed"],
+                },
+            )
 
         finally:
             # Cleanup
@@ -264,6 +346,110 @@ class FileIPCBackend(AutoCADBackend):
                     f.unlink(missing_ok=True)
                 except OSError:
                     pass
+            self._release_dispatch_lease()
+
+    def _lease_path(self) -> Path:
+        return self._ipc_dir / LEASE_FILENAME
+
+    async def _acquire_dispatch_lease(self, request_id: str, command: str) -> dict[str, object]:
+        """Acquire the shared AutoCAD dispatch lease without blocking the loop."""
+        started = time.monotonic()
+        reclaimed = False
+        lease_path = self._lease_path()
+        lease_data = {
+            "token": uuid.uuid4().hex,
+            "session_id": self._session_id,
+            "pid": os.getpid(),
+            "request_id": request_id,
+            "command": command,
+            "created_at": time.time(),
+        }
+
+        while True:
+            try:
+                fd = os.open(str(lease_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="utf-8") as lease_file:
+                    json.dump(lease_data, lease_file)
+                self._lease_token = str(lease_data["token"])
+                return {
+                    "acquired": True,
+                    "waited_seconds": round(time.monotonic() - started, 3),
+                    "reclaimed": reclaimed,
+                }
+            except FileExistsError:
+                existing = self._read_dispatch_lease()
+                if self._lease_is_stale(lease_path):
+                    if self._reclaim_dispatch_lease(existing):
+                        reclaimed = True
+                        continue
+
+                if time.monotonic() - started >= TIMEOUT:
+                    return {
+                        "acquired": False,
+                        "waited_seconds": round(time.monotonic() - started, 3),
+                        "reclaimed": reclaimed,
+                    }
+                await asyncio.sleep(POLL_INTERVAL)
+            except OSError:
+                return {
+                    "acquired": False,
+                    "waited_seconds": round(time.monotonic() - started, 3),
+                    "reclaimed": reclaimed,
+                }
+
+    def _read_dispatch_lease(self) -> dict | None:
+        try:
+            return json.loads(self._lease_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def _lease_is_stale(lease_path: Path) -> bool:
+        try:
+            return time.time() - lease_path.stat().st_mtime > LEASE_STALE_THRESHOLD
+        except OSError:
+            return False
+
+    def _reclaim_dispatch_lease(self, existing: dict | None) -> bool:
+        """Remove a stale lease and its abandoned session files."""
+        lease_path = self._lease_path()
+        try:
+            lease_path.unlink()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+        if existing:
+            self._cleanup_session_files(existing.get("session_id"), stale_only=False)
+        return True
+
+    def _refresh_dispatch_lease(self) -> bool:
+        """Refresh the lease heartbeat if this request still owns it."""
+        if not self._lease_token:
+            return False
+        current = self._read_dispatch_lease()
+        if not current or current.get("token") != self._lease_token:
+            return False
+        try:
+            now = time.time()
+            os.utime(self._lease_path(), (now, now))
+            return True
+        except OSError:
+            return False
+
+    def _release_dispatch_lease(self) -> None:
+        """Release only the lease created by this request."""
+        if not self._lease_token:
+            return
+        try:
+            current = self._read_dispatch_lease()
+            if current and current.get("token") == self._lease_token:
+                self._lease_path().unlink(missing_ok=True)
+        except OSError:
+            pass
+        finally:
+            self._lease_token = None
 
     def _find_command_line_hwnd(self) -> int | None:
         """Find AutoCAD's MDIClient child window for command routing."""
@@ -344,7 +530,7 @@ class FileIPCBackend(AutoCADBackend):
     def _type_string(self, s: str, cancel_first: bool = False):
         """Type an arbitrary string + Enter into AutoCAD's command line (focus-free)."""
         if sys.platform != "win32":
-            return
+            return False
         try:
             import ctypes
 
@@ -359,8 +545,10 @@ class FileIPCBackend(AutoCADBackend):
             # Enter = carriage return
             post(target, WM_CHAR, 0x0D, 0)
             time.sleep(0.05)
+            return True
         except Exception as e:
             log.error("type_string_failed", error=str(e))
+            return False
 
     def _type_dispatch_trigger(self):
         """Type '(c:mcp-dispatch)' + Enter via WM_CHAR to MDIClient — no focus steal.
@@ -368,29 +556,37 @@ class FileIPCBackend(AutoCADBackend):
         Only sends an ESC prefix when a previous dispatch timed out (recovery),
         so a healthy in-flight command is never cancelled by an unnecessary ESC.
         """
-        self._type_string("(c:mcp-dispatch)", cancel_first=self._needs_recovery)
+        triggered = self._type_string("(c:mcp-dispatch)", cancel_first=self._needs_recovery)
         self._needs_recovery = False
+        return bool(triggered)
 
     def _cleanup_stale_files(self):
-        """Remove stale IPC files from previous sessions."""
-        try:
-            now = time.time()
-            for pattern in ("autocad_mcp_*.json", "autocad_mcp_*.tmp", "autocad_mcp_lisp_*.lsp"):
-                for f in self._ipc_dir.glob(pattern):
-                    if now - f.stat().st_mtime > STALE_THRESHOLD:
-                        f.unlink(missing_ok=True)
-        except OSError:
-            pass
+        """Remove old files from this backend session only."""
+        self._cleanup_session_files(self._session_id, stale_only=True)
 
     def _cleanup_stale_commands(self):
-        """Remove any leftover command files from previously timed-out dispatches.
+        """Remove this session's abandoned command files."""
+        self._cleanup_session_files(self._session_id, stale_only=False, kinds=("cmd",))
 
-        Called before writing a new command file so the LISP dispatcher never
-        processes a stale request (whose result would never match our request_id).
-        """
+    def _cleanup_session_files(
+        self,
+        session_id: str | None,
+        *,
+        stale_only: bool,
+        kinds: tuple[str, ...] = ("cmd", "result", "lisp"),
+    ) -> None:
+        """Clean files owned by one validated session ID."""
+        if not session_id or not all(char.isalnum() or char in "-_" for char in session_id):
+            return
         try:
-            for f in self._ipc_dir.glob("autocad_mcp_cmd_*.json"):
-                f.unlink(missing_ok=True)
+            now = time.time()
+            for kind in kinds:
+                suffix = "lsp" if kind == "lisp" else "json"
+                pattern = f"autocad_mcp_{kind}_{session_id}_*.{suffix}"
+                for file_path in self._ipc_dir.glob(pattern):
+                    if stale_only and now - file_path.stat().st_mtime <= STALE_THRESHOLD:
+                        continue
+                    file_path.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -441,7 +637,7 @@ class FileIPCBackend(AutoCADBackend):
 
         File persists for session; cleaned up by _cleanup_stale_files().
         """
-        request_id = uuid.uuid4().hex[:12]
+        request_id = f"{self._session_id}_{uuid.uuid4().hex[:12]}"
         code_file = self._ipc_dir / f"autocad_mcp_lisp_{request_id}.lsp"
         code_file.write_text(code, encoding="utf-8")
         return await self._dispatch("execute-lisp", {
