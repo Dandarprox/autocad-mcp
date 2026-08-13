@@ -536,7 +536,7 @@
   (cons T (strcat "{\"entity_type\":\"LWPOLYLINE\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
 )
 
-(defun mcp-cmd-create-text (params / x y text height rotation layer)
+(defun mcp-cmd-create-text (params / x y text height rotation layer ent)
   (setq x (mcp-json-get-number params "x"))
   (setq y (mcp-json-get-number params "y"))
   (setq text (mcp-json-get-string params "text"))
@@ -548,8 +548,26 @@
   (if layer
     (progn (ensure_layer_exists layer "white" "CONTINUOUS") (set_current_layer layer))
   )
-  (command "_TEXT" "J" "M" (list x y 0.0) height rotation text)
-  (cons T (strcat "{\"entity_type\":\"TEXT\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
+  (if (not layer) (setq layer (getvar "CLAYER")))
+  ;; entmake avoids the interactive TEXT command, which hangs in AutoCAD 2025+
+  ;; (in-place editor) and leaves the command line in a stuck state.
+  (setq ent (entmakex (list
+    (cons 0 "TEXT")
+    (cons 100 "AcDbEntity")
+    (cons 8 layer)
+    (cons 100 "AcDbText")
+    (cons 10 (list x y 0.0))
+    (cons 40 height)
+    (cons 1 text)
+    (cons 50 (* rotation (/ pi 180.0)))
+    (cons 72 1)
+    (cons 11 (list x y 0.0))
+    (cons 73 2)
+  )))
+  (if (null ent)
+    (cons nil "Failed to create text entity")
+    (cons T (strcat "{\"entity_type\":\"TEXT\",\"handle\":\"" (cdr (assoc 5 (entget ent))) "\"}"))
+  )
 )
 
 (defun mcp-cmd-entity-count (params / layer count ent ent-data)
@@ -810,7 +828,7 @@
   (cons T (strcat "{\"entity_type\":\"ELLIPSE\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
 )
 
-(defun mcp-cmd-create-mtext (params / x y width text height layer)
+(defun mcp-cmd-create-mtext (params / x y width text height layer ent)
   (setq x (mcp-json-get-number params "x"))
   (setq y (mcp-json-get-number params "y"))
   (setq width (mcp-json-get-number params "width"))
@@ -819,8 +837,22 @@
   (if (not height) (setq height 2.5))
   (setq layer (mcp-json-get-string params "layer"))
   (if layer (progn (ensure_layer_exists layer "white" "CONTINUOUS") (set_current_layer layer)))
-  (command "_MTEXT" (list x y 0.0) "_H" height "_W" width text "")
-  (cons T (strcat "{\"entity_type\":\"MTEXT\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
+  (if (not layer) (setq layer (getvar "CLAYER")))
+  ;; entmake avoids the interactive MTEXT editor, mirroring create-text.
+  (setq ent (entmakex (list
+    (cons 0 "MTEXT")
+    (cons 100 "AcDbEntity")
+    (cons 8 layer)
+    (cons 100 "AcDbMText")
+    (cons 10 (list x y 0.0))
+    (cons 40 height)
+    (cons 41 width)
+    (cons 1 text)
+  )))
+  (if (null ent)
+    (cons nil "Failed to create mtext entity")
+    (cons T (strcat "{\"entity_type\":\"MTEXT\",\"handle\":\"" (cdr (assoc 5 (entget ent))) "\"}"))
+  )
 )
 
 (defun mcp-cmd-create-hatch (params / entity-id pattern ent)
@@ -1269,57 +1301,57 @@
 ;; Main dispatcher — called by "(c:mcp-dispatch)" from Python
 ;; -----------------------------------------------------------------------
 
-(defun c:mcp-dispatch ( / cmd-files cmd-file json-text request-id cmd-name params-str result result-file)
-  "Find pending command file, dispatch, write result."
-  ;; Find first pending command file
-  (setq cmd-files (vl-directory-files *mcp-ipc-dir* "autocad_mcp_cmd_*.json" 1))
-  (if (not cmd-files)
-    (progn (princ "\nMCP: No pending commands") (princ))
+(defun mcp-process-cmd-file (cmd-file / json-text request-id cmd-name result result-file)
+  "Dispatch a single command file and write its result file."
+  (setq json-text (mcp-read-file-lines cmd-file))
+  (if (not json-text)
+    (princ "\nMCP: Cannot read command file")
     (progn
-      ;; Process first command
-      (setq cmd-file (strcat *mcp-ipc-dir* (car cmd-files)))
-      (setq json-text (mcp-read-file-lines cmd-file))
+      ;; Parse command
+      (setq request-id (mcp-json-get-string json-text "request_id"))
+      (setq cmd-name (mcp-json-get-string json-text "command"))
 
-      (if (not json-text)
-        (princ "\nMCP: Cannot read command file")
+      (if (not cmd-name)
+        (princ "\nMCP: No command in payload")
         (progn
-          ;; Parse command
-          (setq request-id (mcp-json-get-string json-text "request_id"))
-          (setq cmd-name (mcp-json-get-string json-text "command"))
+          (princ (strcat "\nMCP: Dispatching " cmd-name " [" request-id "]"))
 
-          (if (not cmd-name)
-            (princ "\nMCP: No command in payload")
-            (progn
-              (princ (strcat "\nMCP: Dispatching " cmd-name " [" request-id "]"))
-
-              ;; Execute via whitelist dispatcher
-              (setq result
-                (vl-catch-all-apply
-                  'mcp-dispatch-command
-                  (list cmd-name json-text)
-                )
-              )
-
-              ;; Handle error from vl-catch-all-apply
-              (if (vl-catch-all-error-p result)
-                (setq result (cons nil (vl-catch-all-error-message result)))
-              )
-
-              ;; Write result
-              (setq result-file (strcat *mcp-ipc-dir* "autocad_mcp_result_" request-id ".json"))
-              (if (car result)
-                (mcp-write-result result-file request-id T (cdr result) nil)
-                (mcp-write-result result-file request-id nil nil (cdr result))
-              )
-
-              (princ (strcat "\nMCP: Done " cmd-name))
+          ;; Execute via whitelist dispatcher
+          (setq result
+            (vl-catch-all-apply
+              'mcp-dispatch-command
+              (list cmd-name json-text)
             )
           )
 
-          ;; Clean up command file
-          (vl-file-delete cmd-file)
+          ;; Handle error from vl-catch-all-apply
+          (if (vl-catch-all-error-p result)
+            (setq result (cons nil (vl-catch-all-error-message result)))
+          )
+
+          ;; Write result
+          (setq result-file (strcat *mcp-ipc-dir* "autocad_mcp_result_" request-id ".json"))
+          (if (car result)
+            (mcp-write-result result-file request-id T (cdr result) nil)
+            (mcp-write-result result-file request-id nil nil (cdr result))
+          )
+
+          (princ (strcat "\nMCP: Done " cmd-name))
         )
       )
+    )
+  )
+  ;; Clean up command file
+  (vl-file-delete cmd-file)
+)
+
+(defun c:mcp-dispatch ( / cmd-files)
+  "Dispatch ALL pending command files, writing a result for each (self-healing)."
+  (setq cmd-files (vl-directory-files *mcp-ipc-dir* "autocad_mcp_cmd_*.json" 1))
+  (if (not cmd-files)
+    (progn (princ "\nMCP: No pending commands") (princ))
+    (foreach f cmd-files
+      (mcp-process-cmd-file (strcat *mcp-ipc-dir* f))
     )
   )
   (princ)
@@ -1371,7 +1403,7 @@
 ;; Startup message
 ;; -----------------------------------------------------------------------
 
-(princ "\n=== MCP Dispatch v3.1 loaded ===")
+(princ "\n=== MCP Dispatch v3.2 loaded ===")
 (princ "\nIPC directory: ")
 (princ *mcp-ipc-dir*)
 (princ "\nReady for commands via (c:mcp-dispatch)")

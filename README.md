@@ -205,6 +205,15 @@ AutoLISP was added to AutoCAD LT in the **2024 release (Windows only)**. AutoCAD
 
 The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
 
+## What's New in v3.2
+
+- **Auto-load dispatcher** — On first run, if `mcp_dispatch.lsp` isn't loaded, the server now types `(load "...")` into AutoCAD automatically and re-pings instead of failing with a manual-instruction error.
+- **`entmake` text creation** — `create_text` and `create_mtext` now build entities with `entmake` instead of the interactive `TEXT`/`MTEXT` commands, which hang AutoCAD 2025+ (in-place editor) and leave the command line stuck.
+- **ESC only on recovery** — The dispatch trigger no longer sends a cancel-ESC prefix on every call (which interfered with rapid sequential dispatches). ESC is now sent only when the previous dispatch timed out.
+- **Timeout recovery** — A timed-out dispatch now cancels any stuck command (ESC to the main frame, MDIClient, and edit controls) and flags recovery for the next call, stopping cascading failures.
+- **Self-healing dispatch loop** — `c:mcp-dispatch` now processes *all* pending command files (not just the first), so stale files left by a prior timeout can no longer block subsequent requests.
+- **Aggressive stale-command cleanup** — Leftover `autocad_mcp_cmd_*.json` files are removed before each dispatch.
+
 ## What's New in v3.1
 
 - **`execute_lisp`** — Run arbitrary AutoLISP code via temp file pattern. Turns the server from a fixed command set into an extensible automation platform.

@@ -546,5 +546,5 @@ def main():
         ],
     )
 
-    log.info("autocad_mcp_starting", version="3.1.0")
+    log.info("autocad_mcp_starting", version="3.2.0")
     mcp.run(transport="stdio")

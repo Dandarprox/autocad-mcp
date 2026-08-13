@@ -62,6 +62,8 @@ class FileIPCBackend(AutoCADBackend):
         self._ipc_dir = Path(IPC_DIR)
         self._screenshot_provider = None
         self._lock = asyncio.Lock()  # Single in-flight command
+        self._needs_recovery = False  # Set when a dispatch times out
+        self._escape_targets: list[int] = []  # HWNDs used for ESC cancellation
 
     @property
     def name(self) -> str:
@@ -98,6 +100,7 @@ class FileIPCBackend(AutoCADBackend):
 
         # Find command-line child edit control for focus-free dispatch
         self._command_hwnd = self._find_command_line_hwnd()
+        self._escape_targets = self._find_escape_targets()
         log.info("command_line_hwnd", hwnd=self._command_hwnd)
 
         # Ensure IPC directory exists
@@ -106,20 +109,46 @@ class FileIPCBackend(AutoCADBackend):
         # Clean up stale IPC files
         self._cleanup_stale_files()
 
-        # Ping the dispatcher to verify it's loaded
+        # Verify the dispatcher is loaded; auto-load it if it isn't
         result = await self._dispatch("ping", {})
+        if not result.ok:
+            result = await self._auto_load_dispatcher()
+
         if not result.ok:
             lisp_path = str(LISP_DIR / "mcp_dispatch.lsp").replace("\\", "/")
             return CommandResult(
                 ok=False,
                 error=(
-                    "AutoCAD LT detected but mcp_dispatch.lsp not loaded.\n"
+                    "AutoCAD LT detected but mcp_dispatch.lsp could not be loaded.\n"
                     f'In AutoCAD command line, type:\n  (load "{lisp_path}")\n'
                     "Or add lisp-code/ to trusted paths for auto-loading."
                 ),
             )
 
         return CommandResult(ok=True, payload={"backend": "file_ipc", "hwnd": self._hwnd})
+
+    async def _auto_load_dispatcher(self) -> CommandResult:
+        """Load mcp_dispatch.lsp by typing (load ...) into AutoCAD, then re-ping.
+
+        Recovers from the common "dispatcher not loaded" first-run failure
+        without requiring manual intervention in the AutoCAD UI.
+        """
+        lisp_path = str(LISP_DIR / "mcp_dispatch.lsp").replace("\\", "/")
+        load_cmd = f'(load "{lisp_path}")'
+        log.info("auto_load_dispatcher", path=lisp_path)
+
+        result = CommandResult(ok=False, error="dispatcher auto-load failed")
+        for attempt in range(1, 4):
+            self._send_esc(count=2)
+            time.sleep(0.1)
+            self._type_string(load_cmd)
+            await asyncio.sleep(1.5)  # let AutoCAD finish loading
+            result = await self._dispatch("ping", {})
+            if result.ok:
+                log.info("dispatcher_auto_loaded", attempt=attempt)
+                return result
+
+        return result
 
     async def status(self) -> CommandResult:
         info = {
@@ -147,6 +176,11 @@ class FileIPCBackend(AutoCADBackend):
         try:
             # Strip None values — the simple LISP JSON parser can't handle null
             clean_params = {k: v for k, v in params.items() if v is not None}
+
+            # Remove leftover command files from previously timed-out dispatches
+            # so the LISP dispatcher never picks up a stale request.
+            self._cleanup_stale_commands()
+
             # Atomic write: write to .tmp, then rename
             payload = {
                 "request_id": request_id,
@@ -183,6 +217,11 @@ class FileIPCBackend(AutoCADBackend):
                         pass  # File may be partially written, retry
                 await asyncio.sleep(POLL_INTERVAL)
 
+            # Timeout: clear any stuck command and flag recovery for the next
+            # dispatch so the cascade of failures stops here.
+            self._needs_recovery = True
+            self._send_esc(count=3)
+            log.warning("dispatch_timeout", request_id=request_id, command=command)
             return CommandResult(ok=False, error=f"Timeout waiting for result (request_id={request_id})")
 
         finally:
@@ -213,35 +252,91 @@ class FileIPCBackend(AutoCADBackend):
         except Exception:
             return None
 
-    def _type_dispatch_trigger(self):
-        """Post '(c:mcp-dispatch)' + Enter via WM_CHAR to MDIClient — no focus steal.
+    def _find_escape_targets(self) -> list[int]:
+        """Collect HWNDs that should receive ESC to cancel a stuck command.
 
-        Sends ESC keystrokes first to cancel any stale pending command
-        (e.g. from a previous timeout leaving AutoCAD in a command prompt).
+        Sending ESC to MDIClient alone is not always enough to clear a hung
+        command (e.g. the in-place TEXT editor). Target the main frame, the
+        MDIClient, and any Edit/RichEdit child controls.
         """
+        targets: list[int] = []
+        if self._hwnd:
+            targets.append(self._hwnd)
+        if self._command_hwnd:
+            targets.append(self._command_hwnd)
+        if sys.platform == "win32" and self._hwnd:
+            try:
+                import win32gui
+
+                def cb(child_hwnd, _):
+                    cls = win32gui.GetClassName(child_hwnd)
+                    if "EDIT" in cls.upper():
+                        targets.append(child_hwnd)
+                    return True
+
+                win32gui.EnumChildWindows(self._hwnd, cb, None)
+            except Exception:
+                pass
+
+        # de-duplicate while preserving order
+        seen: set[int] = set()
+        result: list[int] = []
+        for t in targets:
+            if t not in seen:
+                seen.add(t)
+                result.append(t)
+        return result
+
+    def _send_esc(self, count: int = 2):
+        """Post ESC keystrokes to all escape targets to cancel pending commands."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+
+            WM_KEYDOWN = 0x0100
+            WM_KEYUP = 0x0101
+            VK_ESCAPE = 0x1B
+            post = ctypes.windll.user32.PostMessageW
+            targets = self._escape_targets or ([self._command_hwnd] if self._command_hwnd else ([self._hwnd] if self._hwnd else []))
+            for _ in range(count):
+                for t in targets:
+                    if t:
+                        post(t, WM_KEYDOWN, VK_ESCAPE, 0)
+                        post(t, WM_KEYUP, VK_ESCAPE, 0)
+            time.sleep(0.05)
+        except Exception as e:
+            log.error("send_esc_failed", error=str(e))
+
+    def _type_string(self, s: str, cancel_first: bool = False):
+        """Type an arbitrary string + Enter into AutoCAD's command line (focus-free)."""
+        if sys.platform != "win32":
+            return
         try:
             import ctypes
 
             WM_CHAR = 0x0102
-            WM_KEYDOWN = 0x0100
-            WM_KEYUP = 0x0101
-            VK_ESCAPE = 0x1B
-            target = self._command_hwnd or self._hwnd
             post = ctypes.windll.user32.PostMessageW
-
-            # Cancel any pending command (2x ESC for nested commands)
-            for _ in range(2):
-                post(target, WM_KEYDOWN, VK_ESCAPE, 0)
-                post(target, WM_KEYUP, VK_ESCAPE, 0)
-            time.sleep(0.05)
-
-            for ch in "(c:mcp-dispatch)":
+            target = self._command_hwnd or self._hwnd
+            if cancel_first:
+                self._send_esc()
+                time.sleep(0.05)
+            for ch in s:
                 post(target, WM_CHAR, ord(ch), 0)
             # Enter = carriage return
             post(target, WM_CHAR, 0x0D, 0)
             time.sleep(0.05)
         except Exception as e:
-            log.error("dispatch_trigger_failed", error=str(e))
+            log.error("type_string_failed", error=str(e))
+
+    def _type_dispatch_trigger(self):
+        """Type '(c:mcp-dispatch)' + Enter via WM_CHAR to MDIClient — no focus steal.
+
+        Only sends an ESC prefix when a previous dispatch timed out (recovery),
+        so a healthy in-flight command is never cancelled by an unnecessary ESC.
+        """
+        self._type_string("(c:mcp-dispatch)", cancel_first=self._needs_recovery)
+        self._needs_recovery = False
 
     def _cleanup_stale_files(self):
         """Remove stale IPC files from previous sessions."""
@@ -251,6 +346,18 @@ class FileIPCBackend(AutoCADBackend):
                 for f in self._ipc_dir.glob(pattern):
                     if now - f.stat().st_mtime > STALE_THRESHOLD:
                         f.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _cleanup_stale_commands(self):
+        """Remove any leftover command files from previously timed-out dispatches.
+
+        Called before writing a new command file so the LISP dispatcher never
+        processes a stale request (whose result would never match our request_id).
+        """
+        try:
+            for f in self._ipc_dir.glob("autocad_mcp_cmd_*.json"):
+                f.unlink(missing_ok=True)
         except OSError:
             pass
 
